@@ -457,6 +457,7 @@ int main(int argc, char *argv[])
 
   uint64_t txPackets = 0, rxPackets = 0, rxBytes = 0;
   double sumDelay = 0.0;
+  std::vector<uint64_t> dropByReason;
   for (auto &kv : stats)
     {
       Ipv4FlowClassifier::FiveTuple t = classifier->FindFlow (kv.first);
@@ -466,8 +467,16 @@ int main(int argc, char *argv[])
           rxPackets += kv.second.rxPackets;
           rxBytes   += kv.second.rxBytes;
           sumDelay  += kv.second.delaySum.GetSeconds ();
+          if (dropByReason.size() < kv.second.packetsDropped.size())
+              dropByReason.resize(kv.second.packetsDropped.size(), 0);
+          for (size_t i = 0; i < kv.second.packetsDropped.size(); ++i)
+              dropByReason[i] += kv.second.packetsDropped[i];
         }
     }
+  std::cout << "DROPREASON";
+  for (size_t i = 0; i < dropByReason.size(); ++i)
+      std::cout << " r" << i << "=" << dropByReason[i];
+  std::cout << std::endl;
 
   double deliveryRatio  = (txPackets > 0) ? (100.0 * rxPackets / txPackets) : 0.0;
   double avgDelayMs     = (rxPackets > 0) ? (1000.0 * sumDelay / rxPackets) : 0.0;

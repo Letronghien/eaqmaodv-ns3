@@ -472,7 +472,8 @@ RoutingProtocol::Start()
   // SAQMAODV: push initial params + start adaptive controller
   m_qtable.SetMaxPaths(m_maxPaths);
   m_qtable.SetLearningParameters(m_alpha0, m_gamma, m_epsilon0);
-  m_qtable.SetRewardWeights(m_w1, m_w2, m_w3);
+  m_qtable.SetRewardWeights(m_w1, m_w2, m_w3, m_w4);
+  m_qtable.SetQueueThresholds(m_queueHighThresh, m_queueLowThresh);
   m_qtable.SetTdErrorParams(m_muTdError, m_kappaTdError);
   m_qtable.SetSeqNoWindow(m_seqNoWindow);
   m_qtable.SetLowEnergyThreshold(m_lowEnergyThreshold);
@@ -526,10 +527,22 @@ RoutingProtocol::RouteOutput(Ptr<Packet> p,
             bool fresh = m_routingTable.LookupRoute(chosenRt.GetNextHop(), nbrCheck)
                          && nbrCheck.GetFlag() == VALID
                          && nbrCheck.GetLifeTime() > Seconds(0);
-            double ack    = fresh ? 1.0 : 0.0;
-            double delayS = fresh ? 0.005 : 1.0;
+            // EA-QMAODV Fix#1: ket hop tin hieu MAC-layer that (TxError gan day)
+            // thay vi chi dua vao 'fresh' (proxy topo, gan nhu luon dung).
+            bool recentTxError = false;
+            auto txErrIt = m_nhLastTxError.find(chosenRt.GetNextHop());
+            if (txErrIt != m_nhLastTxError.end() &&
+                (Simulator::Now() - txErrIt->second) < Seconds(2.0))
+            {
+                recentTxError = true;
+            }
+            double ack    = (fresh && !recentTxError) ? 1.0 : 0.0;
+            double delayS = (fresh && !recentTxError) ? 0.005 : 1.0;
             double eFrac  = GetEnergyFraction();
-            m_qtable.UpdateQValueOrCreate(chosenRt, ack, delayS, eFrac);
+            double qRatio = m_maxQueueLen > 0
+                ? std::min(1.0, static_cast<double>(m_queue.GetSize()) / static_cast<double>(m_maxQueueLen))
+                : 0.0;
+            m_qtable.UpdateQValueOrCreate(chosenRt, ack, delayS, eFrac, qRatio);
         }
         route = chosenRt.GetRoute();
         NS_ASSERT(route);
@@ -1836,7 +1849,10 @@ RoutingProtocol::RecvReply(Ptr<Packet> p, Ipv4Address receiver, Ipv4Address send
         // (2) Add new route + apply positive Q-update with the current adaptive
         //     α_t and 3-term reward including residual energy fraction.
         double eFrac = GetEnergyFraction();
-        m_qtable.UpdateQValueOrCreate(newEntry, /*ack=*/1.0, /*delaySec=*/0.005, eFrac);
+        double qRatio = m_maxQueueLen > 0
+            ? std::min(1.0, static_cast<double>(m_queue.GetSize()) / static_cast<double>(m_maxQueueLen))
+            : 0.0;
+        m_qtable.UpdateQValueOrCreate(newEntry, /*ack=*/1.0, /*delaySec=*/0.005, eFrac, qRatio);
     }
 
     // Acknowledge receipt of the RREP by sending a RREP-ACK message back
@@ -2178,6 +2194,9 @@ void
 RoutingProtocol::SendRerrWhenBreaksLinkToNextHop(Ipv4Address nextHop)
 {
     NS_LOG_FUNCTION(this << nextHop);
+    // EA-QMAODV Fix#1: ghi nhan day la LOI TRUYEN TIN THAT (tu MAC layer),
+    // dung lam tin hieu "ack" thay vi chi dua vao route-table freshness.
+    m_nhLastTxError[nextHop] = Simulator::Now();
     RerrHeader rerrHeader;
     std::vector<Ipv4Address> precursors;
     std::map<Ipv4Address, uint32_t> unreachable;
@@ -2490,7 +2509,7 @@ RoutingProtocol::PeriodicAdaptiveTick()
   // (2) Recompute α_t from Δ_Seq (§4.3)
   m_qtable.RecomputeAdaptiveAlpha();
   // (3) Update reward weights based on residual energy (§4.4)
-  m_qtable.RecomputeAdaptiveRewardWeights(GetEnergyFraction());
+  m_qtable.RecomputeAdaptiveRewardWeightsWithQueue(GetEnergyFraction(), m_qtable.GetMeanQueueRatio());
   // Re-arm the timer
   m_periodicAdaptEvent =
       Simulator::Schedule(m_periodicAdaptInterval,

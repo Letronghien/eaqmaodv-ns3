@@ -261,14 +261,37 @@ bool QTable::AddRoute(const RoutingTableEntry& rt)
     {
         vec.emplace_back(rt, 0.0);
     }
+    ReinitQValues(rt.GetDestination());
     return true;
 }
 
-void QTable::ReinitQValues(Ipv4Address dst)
+void
+QTable::ReinitQValues(Ipv4Address dst)
 {
     auto it = m_records.find(dst);
-    if (it != m_records.end())
-        for (auto& r : it->second) r.qValue = 0.0;
+    if (it == m_records.end())
+        return;
+
+    // FIX-ColdStart: seed Q0 = (1/HC_i) / Sum_k(1/HC_k) cho cac route CHUA hoc
+    // (txCount==0), giu nguyen Q cua route DA hoc. Truoc day ham nay xoa het
+    // ve 0.0 va khong duoc goi o dau ca -> route moi luon thua route cu tich
+    // luy Q duong, du route cu co the da loi thoi do di chuyen.
+    double sumInv = 0.0;
+    for (const auto& r : it->second)
+    {
+        uint32_t hc = std::max<uint32_t>(1, r.rt.GetHop());
+        sumInv += 1.0 / static_cast<double>(hc);
+    }
+    if (sumInv <= 0.0)
+        return;
+
+    for (auto& r : it->second)
+    {
+        if (r.txCount > 0)
+            continue;
+        uint32_t hc = std::max<uint32_t>(1, r.rt.GetHop());
+        r.qValue = (1.0 / static_cast<double>(hc)) / sumInv;
+    }
 }
 
 uint32_t QTable::GetRoutes(Ipv4Address dst,
@@ -292,16 +315,65 @@ std::vector<QRecord> QTable::BuildCandidates(const RoutingTableEntry& primary,
 {
     std::vector<QRecord> cands;
     auto it = m_records.find(primary.GetDestination());
+    Ipv4Address primNh = primary.GetNextHop();
+
+    // FIX-StaleRoute: truoc day copy nguyen m_records[dst] lam candidate,
+    // KHONG kiem tra con VALID/con song hay khong -> de chon phai next-hop
+    // da gay (gay DROP_ROUTE_ERROR) chi vi Q-value cu con cao. Loc lai
+    // giong QMAODV: chi giu candidate con VALID, con thoi gian song, VA
+    // con la neighbor VALID trong bang dinh tuyen chinh (mainTable).
     if (it != m_records.end())
-        cands = it->second;
+    {
+        for (const auto& r : it->second)
+        {
+            if (r.rt.GetNextHop() == primNh)
+                continue;
+            if (r.rt.GetFlag() != VALID || r.rt.GetLifeTime() <= Time(0))
+                continue;
+            if (mainTable != nullptr)
+            {
+                RoutingTableEntry nbr;
+                if (!const_cast<RoutingTable*>(mainTable)->LookupRoute(r.rt.GetNextHop(), nbr) ||
+                    nbr.GetFlag() != VALID)
+                {
+                    continue;
+                }
+            }
+            cands.push_back(r);
+        }
+    }
 
-    // Ensure primary route is present
-    bool found = false;
-    for (auto& c : cands)
-        if (c.rt.GetNextHop() == primary.GetNextHop()) { found = true; break; }
-    if (!found)
-        cands.emplace_back(primary, 0.0);
-
+    // Ensure primary route is present - dung Q da hoc neu co (khong con
+    // bi thiet thoi so voi alternate), khong thi seed theo hop-count.
+    double primQ = 0.0;
+    bool primFound = false;
+    if (it != m_records.end())
+    {
+        for (const auto& r : it->second)
+        {
+            if (r.rt.GetNextHop() == primNh)
+            {
+                primQ = r.qValue;
+                primFound = true;
+                break;
+            }
+        }
+    }
+    double primQValue;
+    if (primFound)
+    {
+        primQValue = primQ;
+    }
+    else
+    {
+        double sumInv = 1.0 / std::max<uint32_t>(1, primary.GetHop());
+        for (const auto& c : cands)
+            sumInv += 1.0 / std::max<uint32_t>(1, c.rt.GetHop());
+        primQValue = (sumInv > 0.0)
+            ? (1.0 / std::max<uint32_t>(1, primary.GetHop())) / sumInv
+            : 0.5;
+    }
+    cands.insert(cands.begin(), QRecord(primary, primQValue));
     return cands;
 }
 
@@ -314,6 +386,7 @@ bool QTable::SelectEpsilonGreedy(const RoutingTableEntry& primary,
                                   const RoutingTable* mainTable)
 {
     auto cands = BuildCandidates(primary, mainTable);
+    std::cout << "DIAG CandSize=" << cands.size() << " Epsilon=" << m_epsilon << " Alpha=" << m_alpha << std::endl;
     if (cands.empty()) { out = primary; return true; }
 
     if (m_uniform->GetValue() < m_epsilon)
